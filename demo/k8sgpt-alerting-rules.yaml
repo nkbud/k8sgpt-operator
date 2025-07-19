@@ -1,0 +1,173 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: k8sgpt-demo-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: kube-prometheus-stack
+    app.kubernetes.io/instance: kube-prometheus-stack
+spec:
+  groups:
+  - name: k8sgpt-demo.rules
+    interval: 30s
+    rules:
+    
+    # Pod-level alerts that K8sGPT can analyze
+    - alert: K8sGPTPodCrashLooping
+      expr: |
+        rate(kube_pod_container_status_restarts_total{namespace="k8sgpt-demo"}[5m]) > 0.1
+      for: 2m
+      labels:
+        severity: warning
+        component: pod
+        k8sgpt_analyzable: "true"
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is crash looping"
+        description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} has restarted {{ $value }} times in the last 5 minutes."
+        k8sgpt_trigger: "pod-analysis"
+
+    - alert: K8sGPTPodNotReady
+      expr: |
+        kube_pod_status_ready{namespace="k8sgpt-demo"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        component: pod
+        k8sgpt_analyzable: "true"
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is not ready"
+        description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been in not ready state for more than 5 minutes."
+        k8sgpt_trigger: "pod-analysis"
+
+    - alert: K8sGPTImagePullBackOff
+      expr: |
+        kube_pod_container_status_waiting_reason{namespace="k8sgpt-demo", reason="ImagePullBackOff"} == 1
+      for: 1m
+      labels:
+        severity: critical
+        component: pod
+        k8sgpt_analyzable: "true"
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has ImagePullBackOff"
+        description: "Container {{ $labels.container }} in pod {{ $labels.namespace }}/{{ $labels.pod }} is in ImagePullBackOff state."
+        k8sgpt_trigger: "image-analysis"
+
+    - alert: K8sGPTContainerOOMKilled
+      expr: |
+        increase(kube_pod_container_status_restarts_total{namespace="k8sgpt-demo"}[5m]) > 0
+        and
+        kube_pod_container_status_last_terminated_reason{namespace="k8sgpt-demo", reason="OOMKilled"} == 1
+      for: 1m
+      labels:
+        severity: critical
+        component: pod
+        k8sgpt_analyzable: "true"
+      annotations:
+        summary: "Container {{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} was OOM killed"
+        description: "Container {{ $labels.container }} in pod {{ $labels.namespace }}/{{ $labels.pod }} was killed due to out of memory."
+        k8sgpt_trigger: "resource-analysis"
+
+    # Deployment-level alerts
+    - alert: K8sGPTDeploymentReplicasMismatch
+      expr: |
+        kube_deployment_spec_replicas{namespace="k8sgpt-demo"}
+        !=
+        kube_deployment_status_replicas_available{namespace="k8sgpt-demo"}
+      for: 5m
+      labels:
+        severity: warning
+        component: deployment
+        k8sgpt_analyzable: "true"
+      annotations:
+        summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} has mismatched replicas"
+        description: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} has {{ $value }} replicas available, but {{ $labels.spec_replicas }} are desired."
+        k8sgpt_trigger: "deployment-analysis"
+
+    # Service-level alerts  
+    - alert: K8sGPTServiceNoEndpoints
+      expr: |
+        kube_service_spec_type{namespace="k8sgpt-demo"} * on (namespace, service) group_left()
+        (kube_endpoint_address_available{namespace="k8sgpt-demo"} == 0)
+      for: 3m
+      labels:
+        severity: warning
+        component: service
+        k8sgpt_analyzable: "true"
+      annotations:
+        summary: "Service {{ $labels.namespace }}/{{ $labels.service }} has no endpoints"
+        description: "Service {{ $labels.namespace }}/{{ $labels.service }} has no available endpoints."
+        k8sgpt_trigger: "service-analysis"
+
+    # Resource constraint alerts
+    - alert: K8sGPTPodPending
+      expr: |
+        kube_pod_status_phase{namespace="k8sgpt-demo", phase="Pending"} == 1
+      for: 5m
+      labels:
+        severity: warning
+        component: pod
+        k8sgpt_analyzable: "true"
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is stuck in Pending state"
+        description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been in Pending state for more than 5 minutes."
+        k8sgpt_trigger: "scheduling-analysis"
+
+    # Storage alerts
+    - alert: K8sGPTPVCPending
+      expr: |
+        kube_persistentvolumeclaim_status_phase{namespace="k8sgpt-demo", phase="Pending"} == 1
+      for: 2m
+      labels:
+        severity: warning
+        component: storage
+        k8sgpt_analyzable: "true"
+      annotations:
+        summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is pending"
+        description: "PersistentVolumeClaim {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} has been in Pending state for more than 2 minutes."
+        k8sgpt_trigger: "storage-analysis"
+
+    # K8sGPT operator health alerts
+    - alert: K8sGPTOperatorDown
+      expr: |
+        up{job="k8sgpt-operator-metrics"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        component: k8sgpt-operator
+      annotations:
+        summary: "K8sGPT operator is down"
+        description: "K8sGPT operator has been down for more than 1 minute."
+
+    - alert: K8sGPTAnalysisStale
+      expr: |
+        time() - k8sgpt_last_analysis_timestamp > 600
+      for: 5m
+      labels:
+        severity: warning
+        component: k8sgpt-operator
+      annotations:
+        summary: "K8sGPT analysis is stale"
+        description: "K8sGPT has not performed analysis in the last 10 minutes."
+
+  - name: k8sgpt-demo.recording-rules
+    interval: 30s
+    rules:
+    
+    # Recording rules for K8sGPT metrics
+    - record: k8sgpt:pod_issues:rate5m
+      expr: |
+        sum by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{namespace="k8sgpt-demo"}[5m])
+        )
+
+    - record: k8sgpt:deployment_availability:ratio
+      expr: |
+        kube_deployment_status_replicas_available{namespace="k8sgpt-demo"}
+        /
+        kube_deployment_spec_replicas{namespace="k8sgpt-demo"}
+
+    - record: k8sgpt:service_endpoint_availability:ratio
+      expr: |
+        kube_endpoint_address_available{namespace="k8sgpt-demo"}
+        /
+        (kube_endpoint_address_available{namespace="k8sgpt-demo"} + kube_endpoint_address_not_ready{namespace="k8sgpt-demo"})

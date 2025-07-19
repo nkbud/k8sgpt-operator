@@ -1,0 +1,55 @@
+---
+# Missing image application - references non-existent container image
+apiVersion: apps/v1
+kind: Deployment  
+metadata:
+  name: missing-image
+  namespace: k8sgpt-demo
+  labels:
+    app: missing-image
+    demo-scenario: image-pull-failure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: missing-image
+  template:
+    metadata:
+      labels:
+        app: missing-image
+        demo-scenario: image-pull-failure
+    spec:
+      containers:
+      - name: nonexistent-image
+        image: nonexistent-registry.local/missing/application:v999  # This image doesn't exist
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "10m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+        env:
+        - name: MESSAGE
+          value: "This container will never start due to missing image"
+      restartPolicy: Always
+
+---
+# Service for missing image application
+apiVersion: v1
+kind: Service
+metadata:
+  name: missing-image-svc
+  namespace: k8sgpt-demo
+  labels:
+    app: missing-image
+spec:
+  selector:
+    app: missing-image
+  ports:
+  - port: 80
+    targetPort: 8080  
+    name: http
+  type: ClusterIP
