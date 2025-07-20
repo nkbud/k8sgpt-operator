@@ -1,0 +1,108 @@
+---
+# Resource starvation application - requests more resources than available
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resource-starvation
+  namespace: k8sgpt-demo
+  labels:
+    app: resource-starvation
+    demo-scenario: resource-constraints
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: resource-starvation
+  template:
+    metadata:
+      labels:
+        app: resource-starvation
+        demo-scenario: resource-constraints
+    spec:
+      containers:
+      - name: resource-hungry
+        image: nginx:1.21-alpine
+        resources:
+          requests:
+            memory: "2Gi"     # Intentionally high requests
+            cpu: "1000m"      # that won't fit in Kind cluster
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        ports:
+        - containerPort: 80
+      restartPolicy: Always
+
+---
+# PVC that will fill up (simulated)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: filling-pvc
+  namespace: k8sgpt-demo
+  labels:
+    demo-scenario: storage-filling
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi  # Large storage request that may not be satisfiable
+  storageClassName: standard
+
+---
+# Pod that uses the PVC and fills it up
+apiVersion: v1  
+kind: Pod
+metadata:
+  name: storage-filler
+  namespace: k8sgpt-demo
+  labels:
+    app: storage-filler
+    demo-scenario: storage-filling
+spec:
+  containers:
+  - name: filler
+    image: busybox:1.35
+    command:
+    - /bin/sh
+    - -c
+    - |
+      echo "Creating large files to fill storage..."
+      dd if=/dev/zero of=/data/largefile1.dat bs=1M count=100 || true
+      dd if=/dev/zero of=/data/largefile2.dat bs=1M count=100 || true
+      echo "Storage filling simulation complete"
+      sleep 3600  # Keep running
+    volumeMounts:
+    - name: data-volume
+      mountPath: /data
+    resources:
+      requests:
+        memory: "32Mi"
+        cpu: "10m"
+      limits:
+        memory: "64Mi"
+        cpu: "50m"
+  volumes:
+  - name: data-volume
+    persistentVolumeClaim:
+      claimName: filling-pvc
+  restartPolicy: Always
+
+---  
+# Service for resource starvation demo
+apiVersion: v1
+kind: Service  
+metadata:
+  name: resource-starvation-svc
+  namespace: k8sgpt-demo
+  labels:
+    app: resource-starvation
+spec:
+  selector:
+    app: resource-starvation
+  ports:
+  - port: 80
+    targetPort: 80
+    name: http
+  type: ClusterIP

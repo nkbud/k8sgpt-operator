@@ -1,0 +1,66 @@
+---
+# CrashLoop application - fails to start properly
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crashloop-application  
+  namespace: k8sgpt-demo
+  labels:
+    app: crashloop-application
+    demo-scenario: crash-loop
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: crashloop-application
+  template:
+    metadata:
+      labels:
+        app: crashloop-application
+        demo-scenario: crash-loop
+    spec:
+      containers:
+      - name: failing-container
+        image: busybox:1.35
+        command: 
+        - /bin/sh
+        - -c
+        - |
+          echo "Starting application..."
+          sleep 10
+          echo "Something went wrong!"
+          exit 1  # Always exit with error
+        resources:
+          requests:
+            memory: "16Mi"
+            cpu: "10m"
+          limits:
+            memory: "64Mi"
+            cpu: "50m"
+        livenessProbe:
+          exec:
+            command:
+            - echo
+            - "alive"
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+      restartPolicy: Always
+
+---
+# Service for crashloop application  
+apiVersion: v1
+kind: Service
+metadata:
+  name: crashloop-application-svc
+  namespace: k8sgpt-demo
+  labels:
+    app: crashloop-application
+spec:
+  selector:
+    app: crashloop-application
+  ports:
+  - port: 80
+    targetPort: 8080
+    name: http
+  type: ClusterIP

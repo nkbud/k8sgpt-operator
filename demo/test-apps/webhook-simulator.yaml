@@ -1,0 +1,163 @@
+---
+# Webhook simulator to capture Alertmanager notifications
+# This simulates the integration between Alertmanager and K8sGPT
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8sgpt-webhook-simulator
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-webhook-simulator
+    component: integration
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8sgpt-webhook-simulator
+  template:
+    metadata:
+      labels:
+        app: k8sgpt-webhook-simulator
+        component: integration
+    spec:
+      containers:
+      - name: webhook-sim
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PORT
+          value: "8080"
+        - name: LOG_LEVEL
+          value: "INFO"
+        command:
+        - /bin/sh
+        - -c
+        - |
+          cat > /app/webhook_server.py << 'EOF'
+          #!/usr/bin/env python3
+          import json
+          import logging
+          from datetime import datetime
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import os
+          
+          logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
+          logger = logging.getLogger(__name__)
+          
+          class AlertWebhookHandler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  content_length = int(self.headers['Content-Length'])
+                  post_data = self.rfile.read(content_length)
+                  
+                  try:
+                      alert_data = json.loads(post_data.decode('utf-8'))
+                      
+                      # Log the received alert
+                      timestamp = datetime.now().isoformat()
+                      endpoint = self.path
+                      
+                      logger.info(f"=== ALERT RECEIVED [{timestamp}] ===")
+                      logger.info(f"Endpoint: {endpoint}")
+                      logger.info(f"Alerts: {len(alert_data.get('alerts', []))}")
+                      
+                      for alert in alert_data.get('alerts', []):
+                          logger.info(f"Alert: {alert.get('labels', {}).get('alertname', 'Unknown')}")
+                          logger.info(f"Status: {alert.get('status', 'Unknown')}")  
+                          logger.info(f"Summary: {alert.get('annotations', {}).get('summary', 'N/A')}")
+                          logger.info(f"Description: {alert.get('annotations', {}).get('description', 'N/A')}")
+                          logger.info(f"Labels: {alert.get('labels', {})}")
+                          logger.info("---")
+                      
+                      # Simulate K8sGPT trigger
+                      if endpoint == '/analyze':
+                          logger.info("🔍 TRIGGERING K8SGPT ANALYSIS")
+                          # In real integration, this would trigger K8sGPT analysis
+                      elif endpoint == '/critical':
+                          logger.info("🚨 CRITICAL ALERT - IMMEDIATE ANALYSIS NEEDED")
+                      
+                      self.send_response(200)
+                      self.send_header('Content-type', 'application/json')
+                      self.end_headers()
+                      self.wfile.write(json.dumps({"status": "received", "timestamp": timestamp}).encode())
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing alert: {e}")
+                      self.send_response(400)
+                      self.send_header('Content-type', 'application/json')  
+                      self.end_headers()
+                      self.wfile.write(json.dumps({"error": str(e)}).encode())
+              
+              def do_GET(self):
+                  if self.path == '/health':
+                      self.send_response(200)
+                      self.send_header('Content-type', 'application/json')
+                      self.end_headers()
+                      self.wfile.write(json.dumps({"status": "healthy"}).encode())
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+          
+          if __name__ == '__main__':
+              port = int(os.getenv('PORT', 8080))
+              server = HTTPServer(('0.0.0.0', port), AlertWebhookHandler)
+              logger.info(f"K8sGPT Webhook Simulator listening on port {port}")
+              server.serve_forever()
+          EOF
+          
+          python3 /app/webhook_server.py
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "10m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+---
+# Service for webhook simulator
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8sgpt-webhook-sim
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-webhook-simulator
+spec:
+  selector:
+    app: k8sgpt-webhook-simulator
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: webhook
+  type: ClusterIP
+
+---
+# ServiceMonitor for metrics collection (optional)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: k8sgpt-webhook-sim
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-webhook-simulator
+spec:
+  selector:
+    matchLabels:
+      app: k8sgpt-webhook-simulator
+  endpoints:
+  - port: webhook
+    path: /metrics
+    interval: 30s

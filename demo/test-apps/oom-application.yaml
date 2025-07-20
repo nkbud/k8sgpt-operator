@@ -1,0 +1,71 @@
+---
+# Out of Memory application - consumes memory until OOM killed
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oom-application
+  namespace: k8sgpt-demo
+  labels:
+    app: oom-application
+    demo-scenario: memory-pressure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oom-application
+  template:
+    metadata:
+      labels:
+        app: oom-application
+        demo-scenario: memory-pressure
+    spec:
+      containers:
+      - name: memory-hog
+        image: progrium/stress
+        args:
+        - "--vm"
+        - "1" 
+        - "--vm-bytes"
+        - "512M"
+        - "--vm-hang"
+        - "1"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "10m"
+          limits:
+            memory: "128Mi"  # Intentionally low to cause OOM
+            cpu: "50m"
+        livenessProbe:
+          exec:
+            command:
+            - echo
+            - "alive"
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - echo  
+            - "ready"
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      restartPolicy: Always
+
+---
+# Service for the OOM application
+apiVersion: v1
+kind: Service
+metadata:
+  name: oom-application-svc
+  namespace: k8sgpt-demo
+  labels:
+    app: oom-application
+spec:
+  selector:
+    app: oom-application
+  ports:
+  - port: 80
+    targetPort: 8080
+    name: http
+  type: ClusterIP
