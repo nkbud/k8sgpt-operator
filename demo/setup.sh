@@ -213,16 +213,26 @@ EOF
     log_success "K8sGPT configuration created"
 }
 
-# Deploy webhook simulator
+# Deploy webhook simulator and structured data components
 deploy_webhook_simulator() {
     log_info "Deploying webhook simulator..."
     
     kubectl apply -f "$SCRIPT_DIR/test-apps/webhook-simulator.yaml"
     
+    # Deploy result processor and SNS-like publisher system
+    log_info "Deploying structured data processor and publisher..."
+    kubectl apply -f "$SCRIPT_DIR/result-processor.yaml"
+    kubectl apply -f "$SCRIPT_DIR/publisher-subscriber.yaml"
+    
     # Wait for webhook simulator to be ready
     kubectl wait --for=condition=available --timeout=300s deployment/k8sgpt-webhook-simulator -n "$DEMO_NAMESPACE"
     
-    log_success "Webhook simulator deployed"
+    # Wait for structured data components to be ready
+    kubectl wait --for=condition=available --timeout=300s deployment/k8sgpt-result-processor -n "$DEMO_NAMESPACE"
+    kubectl wait --for=condition=available --timeout=300s deployment/k8sgpt-publisher-service -n "$DEMO_NAMESPACE"  
+    kubectl wait --for=condition=available --timeout=300s deployment/k8sgpt-subscriber-example -n "$DEMO_NAMESPACE"
+    
+    log_success "Webhook simulator and structured data components deployed"
 }
 
 # Display access information
@@ -234,10 +244,34 @@ show_access_info() {
     echo "Alertmanager: http://localhost:9093" 
     echo "Grafana:      http://localhost:3000 (admin/admin123)"
     echo
+    echo "=== Structured Data Endpoints ==="
+    echo "# Port forward to access directly:"
+    echo "kubectl port-forward -n $DEMO_NAMESPACE svc/k8sgpt-publisher-service 8081:8081 &"
+    echo "kubectl port-forward -n $DEMO_NAMESPACE svc/k8sgpt-subscriber-service 8082:8082 &"
+    echo "# Then access:"
+    echo "Publisher:    http://localhost:8081 (topics, subscriptions, stats)"
+    echo "Subscriber:   http://localhost:8082 (analyses, stats)"
+    echo
+    echo "=== SNS-like Topics ==="
+    echo "- k8sgpt.analysis.symptom"
+    echo "- k8sgpt.analysis.explanation" 
+    echo "- k8sgpt.analysis.diagnosis"
+    echo "- k8sgpt.analysis.remediation"
+    echo "- k8sgpt.analysis.recommendation"
+    echo
     echo "=== Useful Commands ==="
     echo "# Check K8sGPT resources:"
     echo "kubectl get k8sgpt -A"
     echo "kubectl get results -A"
+    echo
+    echo "# Monitor structured data processing:"
+    echo "kubectl logs -n $DEMO_NAMESPACE -l app=k8sgpt-result-processor -f"
+    echo "kubectl logs -n $DEMO_NAMESPACE -l app=k8sgpt-publisher -f"
+    echo "kubectl logs -n $DEMO_NAMESPACE -l app=k8sgpt-subscriber -f"
+    echo
+    echo "# Check markdown files generated:"
+    echo "kubectl exec -n $DEMO_NAMESPACE deployment/k8sgpt-result-processor -- ls -la /data/structured/"
+    echo "kubectl exec -n $DEMO_NAMESPACE deployment/k8sgpt-subscriber-example -- ls -la /data/received/"
     echo
     echo "# Monitor alerts:"
     echo "kubectl logs -n $MONITORING_NAMESPACE -l app.kubernetes.io/name=alertmanager"

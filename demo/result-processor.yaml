@@ -1,0 +1,656 @@
+---
+# Result Processor - Structured Data Publisher
+# Watches K8sGPT Result CRs and publishes structured analysis to SNS-like queue
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8sgpt-result-processor
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-result-processor
+    component: data-publisher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8sgpt-result-processor
+  template:
+    metadata:
+      labels:
+        app: k8sgpt-result-processor
+        component: data-publisher
+    spec:
+      serviceAccountName: k8sgpt-result-processor
+      containers:
+      - name: result-processor
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8080
+        env:
+        - name: KUBERNETES_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: PUBLISH_ENDPOINT
+          value: "http://k8sgpt-publisher-service:8081"
+        volumeMounts:
+        - name: structured-data
+          mountPath: /data/structured
+        - name: processor-script
+          mountPath: /app
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install kubernetes pyyaml jinja2 &&
+          cd /app &&
+          python3 result_processor.py
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "25m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+      volumes:
+      - name: structured-data
+        emptyDir: {}
+      - name: processor-script
+        configMap:
+          name: result-processor-script
+          defaultMode: 0755
+
+---
+# Service Account for Result Processor
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8sgpt-result-processor
+  namespace: k8sgpt-demo
+
+---
+# ClusterRole for reading Result CRs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8sgpt-result-processor
+rules:
+- apiGroups: ["core.k8sgpt.ai"]
+  resources: ["results"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8sgpt-result-processor
+subjects:
+- kind: ServiceAccount
+  name: k8sgpt-result-processor
+  namespace: k8sgpt-demo
+roleRef:
+  kind: ClusterRole
+  name: k8sgpt-result-processor
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Service for Result Processor
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8sgpt-result-processor
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-result-processor
+spec:
+  selector:
+    app: k8sgpt-result-processor
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  type: ClusterIP
+
+---
+# ConfigMap with the Python script
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: result-processor-script
+  namespace: k8sgpt-demo
+data:
+  result_processor.py: |
+    #!/usr/bin/env python3
+    """
+    K8sGPT Result Processor
+    
+    Watches for K8sGPT Result custom resources and structures the analysis
+    into structured components (symptom, explanation, diagnosis, remediation, recommendation)
+    then publishes them as markdown files to a simulated SNS-like queue system.
+    """
+    
+    import json
+    import logging
+    import os
+    import re
+    import time
+    from datetime import datetime
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from threading import Thread
+    import yaml
+    
+    try:
+        from kubernetes import client, config, watch
+        import requests
+    except ImportError:
+        pass
+    
+    logging.basicConfig(
+        level=os.getenv('LOG_LEVEL', 'INFO'),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    
+    class StructuredAnalysis:
+        """Structure K8sGPT analysis into components"""
+        
+        def __init__(self):
+            self.templates = {
+                'symptom': """# Symptom
+    
+    **Resource**: {resource_type}/{resource_name}
+    **Namespace**: {namespace}
+    **Detected At**: {timestamp}
+    
+    ## Observed Issues
+    {symptoms}
+    
+    ## Affected Components
+    {affected_components}
+    """,
+                
+                'explanation': """# Explanation
+    
+    ## What This Means
+    {explanation_text}
+    
+    ## Technical Context
+    {technical_context}
+    
+    ## Impact Assessment
+    {impact_assessment}
+    """,
+                
+                'diagnosis': """# Diagnosis
+    
+    ## Root Cause Analysis
+    {root_cause}
+    
+    ## Contributing Factors
+    {contributing_factors}
+    
+    ## System State
+    {system_state}
+    """,
+                
+                'remediation': """# Remediation
+    
+    ## Immediate Actions Required
+    {immediate_actions}
+    
+    ## Step-by-Step Resolution
+    {resolution_steps}
+    
+    ## Validation Steps
+    {validation_steps}
+    """,
+                
+                'recommendation': """# Recommendations
+    
+    ## Prevention Strategies
+    {prevention_strategies}
+    
+    ## Best Practices
+    {best_practices}
+    
+    ## Monitoring & Alerting
+    {monitoring_recommendations}
+    
+    ## Long-term Improvements
+    {long_term_improvements}
+    """
+            }
+    
+        def extract_components_from_result(self, result_spec):
+            """Extract structured components from K8sGPT Result"""
+            
+            # Parse the AI-generated analysis text
+            details = result_spec.get('details', '')
+            errors = result_spec.get('error', [])
+            
+            # Extract key information
+            resource_info = {
+                'resource_type': result_spec.get('kind', 'Unknown'),
+                'resource_name': result_spec.get('name', 'Unknown'),
+                'namespace': result_spec.get('parentObject', 'default').split('/')[-1] if '/' in result_spec.get('parentObject', '') else 'default',
+                'timestamp': datetime.now().isoformat(),
+                'backend': result_spec.get('backend', 'openai')
+            }
+            
+            # Process error messages
+            error_texts = [error.get('text', '') for error in errors]
+            combined_analysis = f"{details}\n\n" + "\n".join(error_texts)
+            
+            return self._structure_analysis(combined_analysis, resource_info)
+    
+        def _structure_analysis(self, analysis_text, resource_info):
+            """Structure the analysis text into the 5 components"""
+            
+            # Use regex and keyword matching to extract different sections
+            symptoms = self._extract_symptoms(analysis_text, resource_info)
+            explanation = self._extract_explanation(analysis_text, resource_info)
+            diagnosis = self._extract_diagnosis(analysis_text, resource_info)
+            remediation = self._extract_remediation(analysis_text, resource_info)
+            recommendation = self._extract_recommendations(analysis_text, resource_info)
+            
+            return {
+                'symptom': self.templates['symptom'].format(
+                    symptoms=symptoms['issues'],
+                    affected_components=symptoms['components'],
+                    **resource_info
+                ),
+                'explanation': self.templates['explanation'].format(
+                    explanation_text=explanation['what_means'],
+                    technical_context=explanation['technical_context'],
+                    impact_assessment=explanation['impact'],
+                    **resource_info
+                ),
+                'diagnosis': self.templates['diagnosis'].format(
+                    root_cause=diagnosis['root_cause'],
+                    contributing_factors=diagnosis['factors'],
+                    system_state=diagnosis['state'],
+                    **resource_info
+                ),
+                'remediation': self.templates['remediation'].format(
+                    immediate_actions=remediation['immediate'],
+                    resolution_steps=remediation['steps'],
+                    validation_steps=remediation['validation'],
+                    **resource_info
+                ),
+                'recommendation': self.templates['recommendation'].format(
+                    prevention_strategies=recommendation['prevention'],
+                    best_practices=recommendation['best_practices'],
+                    monitoring_recommendations=recommendation['monitoring'],
+                    long_term_improvements=recommendation['long_term'],
+                    **resource_info
+                )
+            }
+    
+        def _extract_symptoms(self, text, resource_info):
+            """Extract symptom information"""
+            symptoms = {
+                'issues': [],
+                'components': []
+            }
+            
+            # Look for error indicators
+            error_patterns = [
+                r'error[s]?:?\s*([^\n]+)',
+                r'fail[s|ed|ing|ure]*:?\s*([^\n]+)',
+                r'problem[s]?:?\s*([^\n]+)',
+                r'issue[s]?:?\s*([^\n]+)'
+            ]
+            
+            for pattern in error_patterns:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                symptoms['issues'].extend(matches)
+            
+            # Extract component information
+            if resource_info['resource_type']:
+                symptoms['components'].append(f"{resource_info['resource_type']}/{resource_info['resource_name']}")
+            
+            # If no specific issues found, use general text
+            if not symptoms['issues']:
+                symptoms['issues'] = [text[:200] + "..." if len(text) > 200 else text]
+            
+            return {
+                'issues': "- " + "\n- ".join(symptoms['issues'][:3]),  # Limit to top 3
+                'components': "- " + "\n- ".join(symptoms['components'])
+            }
+    
+        def _extract_explanation(self, text, resource_info):
+            """Extract explanation information"""
+            return {
+                'what_means': self._extract_section_or_default(text, 
+                    ['explanation', 'what this means', 'description'], 
+                    "This indicates an issue with the Kubernetes resource that requires attention."),
+                'technical_context': f"Resource Type: {resource_info['resource_type']}\nBackend: {resource_info['backend']}",
+                'impact': self._extract_section_or_default(text,
+                    ['impact', 'effect', 'consequence'],
+                    "This issue may affect application availability and performance.")
+            }
+    
+        def _extract_diagnosis(self, text, resource_info):
+            """Extract diagnosis information"""
+            return {
+                'root_cause': self._extract_section_or_default(text,
+                    ['cause', 'reason', 'root cause'],
+                    "Analysis of the resource configuration and state indicates potential issues."),
+                'factors': self._extract_section_or_default(text,
+                    ['factor', 'contributing', 'additional'],
+                    "Multiple factors may be contributing to this issue."),
+                'state': f"Resource: {resource_info['resource_type']}/{resource_info['resource_name']}\nNamespace: {resource_info['namespace']}"
+            }
+    
+        def _extract_remediation(self, text, resource_info):
+            """Extract remediation information"""
+            return {
+                'immediate': self._extract_section_or_default(text,
+                    ['fix', 'resolve', 'action', 'remedy'],
+                    "1. Investigate the resource status\n2. Check logs for detailed errors\n3. Verify configuration"),
+                'steps': "1. Review the resource configuration\n2. Apply necessary fixes\n3. Monitor the resource status",
+                'validation': "1. Verify resource is running correctly\n2. Check application functionality\n3. Monitor for recurring issues"
+            }
+    
+        def _extract_recommendations(self, text, resource_info):
+            """Extract recommendation information"""
+            return {
+                'prevention': "- Implement proper resource configuration validation\n- Use resource limits and requests appropriately\n- Follow Kubernetes best practices",
+                'best_practices': f"- Regular health checks for {resource_info['resource_type']} resources\n- Implement proper monitoring\n- Use declarative configuration",
+                'monitoring': "- Set up alerts for resource state changes\n- Monitor resource utilization\n- Implement health check endpoints",
+                'long_term': "- Consider implementing GitOps workflows\n- Regular cluster maintenance\n- Automated testing and validation"
+            }
+    
+        def _extract_section_or_default(self, text, keywords, default):
+            """Extract text section based on keywords or return default"""
+            for keyword in keywords:
+                pattern = rf'{keyword}[:\-\s]*([^\n]{{1,200}})'
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    return match.group(1).strip()
+            return default
+    
+    
+    class SNSPublisher:
+        """Simulates SNS-like publishing for structured analysis"""
+        
+        def __init__(self, endpoint_url):
+            self.endpoint_url = endpoint_url
+            self.topics = {
+                'k8sgpt.analysis.symptom': [],
+                'k8sgpt.analysis.explanation': [],
+                'k8sgpt.analysis.diagnosis': [],  
+                'k8sgpt.analysis.remediation': [],
+                'k8sgpt.analysis.recommendation': []
+            }
+        
+        def publish_structured_analysis(self, analysis_id, structured_data):
+            """Publish structured analysis to topics"""
+            
+            for component, content in structured_data.items():
+                topic = f'k8sgpt.analysis.{component}'
+                
+                message = {
+                    'analysis_id': analysis_id,
+                    'component': component,
+                    'content': content,
+                    'content_type': 'text/markdown',
+                    'timestamp': datetime.now().isoformat(),
+                    'topic': topic
+                }
+                
+                try:
+                    # Simulate publishing to SNS-like queue
+                    self._publish_to_topic(topic, message)
+                    logger.info(f"Published {component} to topic {topic}")
+                    
+                    # Write markdown file
+                    self._write_markdown_file(analysis_id, component, content)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to publish {component}: {e}")
+        
+        def _publish_to_topic(self, topic, message):
+            """Simulate publishing to topic (could be SNS, SQS, etc.)"""
+            
+            # Store in memory for demo (in real implementation, this would be SNS/SQS)
+            if topic not in self.topics:
+                self.topics[topic] = []
+            
+            self.topics[topic].append(message)
+            
+            # Simulate HTTP POST to subscriber endpoint
+            try:
+                if self.endpoint_url:
+                    payload = {
+                        'topic': topic,
+                        'message': message
+                    }
+                    # Note: In real implementation, this would be handled by SNS
+                    # Here we simulate the notification
+                    logger.debug(f"Would notify subscribers of {topic}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to notify endpoint: {e}")
+        
+        def _write_markdown_file(self, analysis_id, component, content):
+            """Write structured data as markdown files"""
+            
+            os.makedirs('/data/structured', exist_ok=True)
+            
+            filename = f'/data/structured/{analysis_id}_{component}.md'
+            
+            try:
+                with open(filename, 'w') as f:
+                    f.write(content)
+                logger.debug(f"Wrote markdown file: {filename}")
+            except Exception as e:
+                logger.error(f"Failed to write {filename}: {e}")
+        
+        def get_topic_stats(self):
+            """Get statistics about published topics"""
+            return {
+                topic: len(messages) 
+                for topic, messages in self.topics.items()
+            }
+    
+    
+    class ResultProcessor:
+        """Main processor that watches Result CRs and publishes structured data"""
+        
+        def __init__(self):
+            self.analyzer = StructuredAnalysis()
+            self.publisher = SNSPublisher(os.getenv('PUBLISH_ENDPOINT'))
+            self.processed_results = set()
+            
+            # Initialize Kubernetes client
+            try:
+                if os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount'):
+                    config.load_incluster_config()
+                else:
+                    config.load_kube_config()
+                
+                self.k8s_client = client.CustomObjectsApi()
+                self.core_v1 = client.CoreV1Api()
+                logger.info("Kubernetes client initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Kubernetes client: {e}")
+                self.k8s_client = None
+    
+        def start_watching(self):
+            """Start watching for Result CRs"""
+            if not self.k8s_client:
+                logger.error("Kubernetes client not available")
+                return
+                
+            logger.info("Starting to watch for Result CRs...")
+            
+            while True:
+                try:
+                    w = watch.Watch()
+                    for event in w.stream(
+                        self.k8s_client.list_cluster_custom_object,
+                        group="core.k8sgpt.ai",
+                        version="v1alpha1", 
+                        plural="results"
+                    ):
+                        self.process_event(event)
+                        
+                except Exception as e:
+                    logger.error(f"Watch error: {e}")
+                    logger.info("Restarting watch in 10 seconds...")
+                    time.sleep(10)
+    
+        def process_event(self, event):
+            """Process a Result CR event"""
+            event_type = event['type']
+            result_obj = event['object']
+            
+            if event_type not in ['ADDED', 'MODIFIED']:
+                return
+                
+            # Extract key information
+            metadata = result_obj.get('metadata', {})
+            spec = result_obj.get('spec', {})
+            
+            result_name = metadata.get('name', 'unknown')
+            result_uid = metadata.get('uid', result_name)
+            
+            # Skip if already processed
+            if result_uid in self.processed_results:
+                return
+            
+            logger.info(f"Processing Result: {result_name}")
+            
+            try:
+                # Structure the analysis
+                structured_data = self.analyzer.extract_components_from_result(spec)
+                
+                # Publish structured data
+                analysis_id = f"{result_name}-{int(time.time())}"
+                self.publisher.publish_structured_analysis(analysis_id, structured_data)
+                
+                # Create event
+                self._create_processing_event(result_name, analysis_id)
+                
+                # Mark as processed
+                self.processed_results.add(result_uid)
+                
+                logger.info(f"Successfully processed and published analysis {analysis_id}")
+                
+            except Exception as e:
+                logger.error(f"Failed to process Result {result_name}: {e}")
+    
+        def _create_processing_event(self, result_name, analysis_id):
+            """Create Kubernetes event for processed result"""
+            try:
+                event = client.CoreosV1Event(
+                    metadata=client.V1ObjectMeta(
+                        name=f"result-processed-{int(time.time())}",
+                        namespace="k8sgpt-demo"
+                    ),
+                    involved_object=client.V1ObjectReference(
+                        api_version="core.k8sgpt.ai/v1alpha1",
+                        kind="Result",
+                        name=result_name,
+                        namespace="default"  # Results are cluster-scoped
+                    ),
+                    reason="ResultProcessed",
+                    message=f"Structured analysis published as {analysis_id}",
+                    type="Normal",
+                    source=client.V1EventSource(component="result-processor"),
+                    first_time=datetime.now(),
+                    last_time=datetime.now(),
+                    count=1
+                )
+                
+                # Note: Events API may differ, this is conceptual
+                logger.debug(f"Would create event for {result_name}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to create event: {e}")
+    
+        def get_stats(self):
+            """Get processing statistics"""
+            return {
+                'processed_results': len(self.processed_results),
+                'topic_stats': self.publisher.get_topic_stats()
+            }
+    
+    
+    class HealthHandler(BaseHTTPRequestHandler):
+        """HTTP handler for health checks and stats"""
+        
+        def __init__(self, processor, *args, **kwargs):
+            self.processor = processor
+            super().__init__(*args, **kwargs)
+    
+        def do_GET(self):
+            if self.path == '/health':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "healthy",
+                    "timestamp": datetime.now().isoformat()
+                }).encode())
+            
+            elif self.path == '/stats':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                stats = self.processor.get_stats()
+                self.wfile.write(json.dumps(stats, indent=2).encode())
+            
+            else:
+                self.send_response(404)
+                self.end_headers()
+    
+    
+    def main():
+        """Main entry point"""
+        logger.info("Starting K8sGPT Result Processor")
+        
+        # Initialize processor
+        processor = ResultProcessor()
+        
+        # Start HTTP server for health checks
+        def create_handler(*args, **kwargs):
+            return HealthHandler(processor, *args, **kwargs)
+        
+        port = int(os.getenv('PORT', 8080))
+        httpd = HTTPServer(('0.0.0.0', port), create_handler)
+        
+        # Start HTTP server in background
+        http_thread = Thread(target=httpd.serve_forever)
+        http_thread.daemon = True
+        http_thread.start()
+        
+        logger.info(f"Health server started on port {port}")
+        logger.info("Health endpoint: /health")
+        logger.info("Stats endpoint: /stats") 
+        
+        # Start processing
+        processor.start_watching()
+    
+    
+    if __name__ == '__main__':
+        main()

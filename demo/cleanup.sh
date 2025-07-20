@@ -44,10 +44,22 @@ cleanup_test_apps() {
     # Delete webhook simulator
     kubectl delete deployment,service k8sgpt-webhook-simulator -n "$DEMO_NAMESPACE" --ignore-not-found=true
     
+    # Delete structured data components
+    log_info "Cleaning up structured data components..."
+    kubectl delete deployment,service k8sgpt-result-processor -n "$DEMO_NAMESPACE" --ignore-not-found=true
+    kubectl delete deployment,service k8sgpt-publisher-service -n "$DEMO_NAMESPACE" --ignore-not-found=true  
+    kubectl delete deployment,service k8sgpt-subscriber-example -n "$DEMO_NAMESPACE" --ignore-not-found=true
+    kubectl delete serviceaccount k8sgpt-result-processor -n "$DEMO_NAMESPACE" --ignore-not-found=true
+    kubectl delete configmap result-processor-script -n "$DEMO_NAMESPACE" --ignore-not-found=true
+    kubectl delete configmap publisher-service-script -n "$DEMO_NAMESPACE" --ignore-not-found=true
+    kubectl delete configmap subscriber-app-script -n "$DEMO_NAMESPACE" --ignore-not-found=true
+    kubectl delete clusterrole k8sgpt-result-processor --ignore-not-found=true
+    kubectl delete clusterrolebinding k8sgpt-result-processor --ignore-not-found=true
+    
     # Delete any remaining test resources
     kubectl delete -f ./test-apps/ --ignore-not-found=true >/dev/null 2>&1 || true
     
-    log_success "Test applications cleaned up"
+    log_success "Test applications and structured data components cleaned up"
 }
 
 # Clean up K8sGPT resources

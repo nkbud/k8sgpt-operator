@@ -36,7 +36,29 @@ The demo creates a complete monitoring and troubleshooting stack:
 - Configured with AI backend (OpenAI)
 - Connected to webhook sink for notifications
 
-### 4. Test Applications
+### 4. Structured Data Publishing System
+**NEW**: Advanced analysis result processing with SNS-like publishing:
+- **Result Processor**: Watches Result CRs and structures analysis into 5 components
+- **SNS-like Publisher**: Manages topics, subscriptions, and message delivery
+- **Example Subscriber**: Demonstrates application integration patterns
+
+#### Structured Components (Published as Markdown)
+1. **Symptom** - What is observed (symptoms, affected components)
+2. **Explanation** - What it means (technical context, impact)
+3. **Diagnosis** - What's wrong (root cause, contributing factors)
+4. **Remediation** - How to fix it (step-by-step resolution)
+5. **Recommendation** - Prevention strategies (best practices, monitoring)
+
+#### Topics for Subscription
+- `k8sgpt.analysis.symptom` - Alert systems subscribe here
+- `k8sgpt.analysis.explanation` - Documentation systems
+- `k8sgpt.analysis.diagnosis` - Investigation tools
+- `k8sgpt.analysis.remediation` - Automation engines  
+- `k8sgpt.analysis.recommendation` - Knowledge bases
+
+See [STRUCTURED_DATA.md](./STRUCTURED_DATA.md) for complete documentation.
+
+### 5. Test Applications
 Sample applications that generate specific alert conditions:
 - **OOM Application**: Causes Out of Memory alerts
 - **CrashLoop Application**: Creates CrashLoopBackOff situations  
@@ -44,20 +66,24 @@ Sample applications that generate specific alert conditions:
 - **Resource Starvation App**: Causes resource constraint alerts
 - **Missing Image App**: References non-existent container images
 
-### 5. Integration Points
+### 6. Integration Points
 
 #### Alertmanager → K8sGPT Integration
 Since k8sgpt-operator doesn't expose a native webhook endpoint for receiving alerts, the demo uses a hybrid approach:
 
 1. **Alert Simulation**: Alertmanager alerts are captured and logged
 2. **K8sGPT Analysis**: The operator performs regular analysis of cluster issues
-3. **Result Correlation**: Results are correlated with alert conditions
-4. **Sink Notifications**: Analysis results are sent to configured sinks (Slack/webhook)
+3. **Result Processing**: Results are structured into standardized components
+4. **SNS-like Publishing**: Components published to topics for application subscription
+5. **Sink Notifications**: Analysis results are sent to configured sinks (Slack/webhook)
 
-#### Monitoring Flow
+#### Enhanced Monitoring Flow
 1. Test applications generate problematic conditions
 2. Prometheus collects metrics and triggers alerts
 3. K8sGPT operator detects issues during analysis cycles
+4. **Result Processor structures analysis into 5 components**
+5. **SNS-like Publisher distributes structured data to subscribers**
+6. **Applications process structured markdown files for automation/alerting**
 4. AI-powered explanations are generated
 5. Results are stored as Custom Resources
 6. Notifications are sent to configured sinks
@@ -99,19 +125,78 @@ kubectl get results -A
 kubectl describe result <result-name>
 ```
 
-### 3. Sink Notification Verification
+### 3. Structured Data Processing Verification
+```bash
+# Check result processor logs
+kubectl logs -n k8sgpt-demo -l app=k8sgpt-result-processor -f
+
+# View generated markdown files
+kubectl exec -n k8sgpt-demo deployment/k8sgpt-result-processor -- ls -la /data/structured/
+
+# Check specific analysis components
+kubectl exec -n k8sgpt-demo deployment/k8sgpt-result-processor -- cat /data/structured/analysis-123_symptom.md
+```
+
+### 4. SNS-like Publisher Verification
+```bash
+# Port forward to access publisher API
+kubectl port-forward -n k8sgpt-demo svc/k8sgpt-publisher-service 8081:8081 &
+
+# Check topics and subscriptions
+curl http://localhost:8081/topics
+curl http://localhost:8081/subscriptions
+curl http://localhost:8081/stats
+```
+
+### 5. Subscriber Application Verification
+```bash
+# Port forward to access subscriber API
+kubectl port-forward -n k8sgpt-demo svc/k8sgpt-subscriber-service 8082:8082 &
+
+# Check received analyses
+curl http://localhost:8082/analyses
+curl http://localhost:8082/stats
+
+# View received markdown files
+kubectl exec -n k8sgpt-demo deployment/k8sgpt-subscriber-example -- ls -la /data/received/
+```
+
+### 6. Sink Notification Verification
 ```bash
 kubectl logs -n k8sgpt-operator-system deployment/k8sgpt-operator
 ```
 
 ## Expected Outputs
 
-### K8sGPT Results
+### K8sGPT Results (Standard)
 Custom Resources containing:
 - Problem identification
 - AI-generated explanations
 - Suggested remediation steps
 - Resource details and context
+
+### Structured Data Components (New)
+Five markdown files per analysis:
+1. **`analysis-id_symptom.md`** - Resource issues and affected components
+2. **`analysis-id_explanation.md`** - Technical context and impact assessment
+3. **`analysis-id_diagnosis.md`** - Root cause analysis and contributing factors
+4. **`analysis-id_remediation.md`** - Step-by-step resolution instructions
+5. **`analysis-id_recommendation.md`** - Prevention strategies and best practices
+
+### SNS-like Messages
+JSON messages published to topics:
+```json
+{
+  "Type": "Notification",
+  "MessageId": "msg-000001", 
+  "TopicArn": "arn:k8sgpt:sns:demo:k8sgpt:k8sgpt.analysis.symptom",
+  "Message": "{\"analysis_id\":\"pod-issue-1642234200\",\"component\":\"symptom\",\"content\":\"# Symptom...\"}",
+  "MessageAttributes": {
+    "AnalysisId": "pod-issue-1642234200",
+    "Component": "symptom"
+  }
+}
+```
 
 ### Sink Notifications
 Webhook payloads containing:

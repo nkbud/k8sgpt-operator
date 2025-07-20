@@ -1,0 +1,897 @@
+---
+# SNS-like Publisher Service
+# Simulates AWS SNS functionality for publishing structured K8sGPT analysis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8sgpt-publisher-service
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-publisher
+    component: messaging
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8sgpt-publisher
+  template:
+    metadata:
+      labels:
+        app: k8sgpt-publisher
+        component: messaging
+    spec:
+      containers:
+      - name: publisher
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8081
+        env:
+        - name: LOG_LEVEL
+          value: "INFO"
+        volumeMounts:
+        - name: publisher-script
+          mountPath: /app
+        - name: published-data
+          mountPath: /data/published
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install flask requests &&
+          cd /app &&
+          python3 publisher_service.py
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "25m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: published-data
+        emptyDir: {}
+      - name: publisher-script
+        configMap:
+          name: publisher-service-script
+          defaultMode: 0755
+
+---
+# Service for Publisher
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8sgpt-publisher-service
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-publisher
+spec:
+  selector:
+    app: k8sgpt-publisher
+  ports:
+  - port: 8081
+    targetPort: 8081
+    name: http
+  type: ClusterIP
+
+---
+# ConfigMap with the Publisher Service script
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: publisher-service-script
+  namespace: k8sgpt-demo
+data:
+  publisher_service.py: |
+    #!/usr/bin/env python3
+    """
+    SNS-like Publisher Service
+    
+    Simulates AWS SNS functionality for publishing structured K8sGPT analysis.
+    Manages topics, subscriptions, and message delivery.
+    """
+    
+    import json
+    import logging
+    import os
+    import time
+    import requests
+    from datetime import datetime
+    from threading import Thread, Lock
+    from collections import defaultdict
+    
+    from flask import Flask, request, jsonify
+    
+    logging.basicConfig(
+        level=os.getenv('LOG_LEVEL', 'INFO'),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    app = Flask(__name__)
+    
+    
+    class TopicManager:
+        """Manages topics and subscriptions similar to AWS SNS"""
+        
+        def __init__(self):
+            self.topics = {}  # topic_arn -> topic_config
+            self.subscriptions = defaultdict(list)  # topic_arn -> [subscription_configs]
+            self.messages = defaultdict(list)  # topic_arn -> [messages]
+            self.lock = Lock()
+            self.message_id_counter = 0
+            
+            # Initialize K8sGPT analysis topics
+            self._initialize_k8sgpt_topics()
+        
+        def _initialize_k8sgpt_topics(self):
+            """Initialize standard K8sGPT analysis topics"""
+            topics = [
+                'k8sgpt.analysis.symptom',
+                'k8sgpt.analysis.explanation', 
+                'k8sgpt.analysis.diagnosis',
+                'k8sgpt.analysis.remediation',
+                'k8sgpt.analysis.recommendation'
+            ]
+            
+            for topic in topics:
+                self.create_topic(topic, {
+                    'DisplayName': topic.replace('.', ' ').title(),
+                    'Description': f'Structured {topic.split(".")[-1]} data from K8sGPT analysis'
+                })
+        
+        def create_topic(self, topic_name, config=None):
+            """Create a new topic"""
+            with self.lock:
+                topic_arn = f'arn:k8sgpt:sns:demo:k8sgpt:{topic_name}'
+                
+                if topic_arn not in self.topics:
+                    self.topics[topic_arn] = {
+                        'name': topic_name,
+                        'arn': topic_arn,
+                        'created_at': datetime.now().isoformat(),
+                        'message_count': 0,
+                        'subscription_count': 0,
+                        **config or {}
+                    }
+                    logger.info(f"Created topic: {topic_name}")
+                
+                return topic_arn
+        
+        def subscribe(self, topic_arn, protocol, endpoint, attributes=None):
+            """Subscribe to a topic"""
+            with self.lock:
+                subscription_arn = f'{topic_arn}:subscription:{int(time.time())}'
+                
+                subscription = {
+                    'arn': subscription_arn,
+                    'topic_arn': topic_arn,
+                    'protocol': protocol,  # http, https, email, sqs, etc.
+                    'endpoint': endpoint,
+                    'created_at': datetime.now().isoformat(),
+                    'confirmed': True,  # Auto-confirm for demo
+                    'attributes': attributes or {},
+                    'delivery_count': 0,
+                    'delivery_errors': 0
+                }
+                
+                self.subscriptions[topic_arn].append(subscription)
+                self.topics[topic_arn]['subscription_count'] += 1
+                
+                logger.info(f"Subscribed {endpoint} to {topic_arn}")
+                return subscription_arn
+        
+        def publish(self, topic_arn, message, attributes=None):
+            """Publish message to topic"""
+            with self.lock:
+                self.message_id_counter += 1
+                message_id = f'msg-{self.message_id_counter:06d}'
+                
+                message_obj = {
+                    'MessageId': message_id,
+                    'TopicArn': topic_arn,
+                    'Message': message,
+                    'Timestamp': datetime.now().isoformat(),
+                    'MessageAttributes': attributes or {},
+                    'Subject': attributes.get('Subject', '') if attributes else ''
+                }
+                
+                # Store message
+                self.messages[topic_arn].append(message_obj)
+                self.topics[topic_arn]['message_count'] += 1
+                
+                # Deliver to subscribers
+                Thread(target=self._deliver_message, args=(topic_arn, message_obj)).start()
+                
+                return message_id
+        
+        def _deliver_message(self, topic_arn, message):
+            """Deliver message to all subscribers"""
+            subscriptions = self.subscriptions.get(topic_arn, [])
+            
+            for subscription in subscriptions:
+                try:
+                    if subscription['protocol'] == 'http':
+                        self._deliver_http(subscription, message)
+                    elif subscription['protocol'] == 'https':
+                        self._deliver_https(subscription, message)
+                    elif subscription['protocol'] == 'webhook':
+                        self._deliver_webhook(subscription, message)
+                    
+                    subscription['delivery_count'] += 1
+                    
+                except Exception as e:
+                    logger.error(f"Delivery failed to {subscription['endpoint']}: {e}")
+                    subscription['delivery_errors'] += 1
+        
+        def _deliver_http(self, subscription, message):
+            """Deliver message via HTTP POST"""
+            endpoint = subscription['endpoint']
+            
+            payload = {
+                'Type': 'Notification',
+                'MessageId': message['MessageId'],
+                'TopicArn': message['TopicArn'], 
+                'Subject': message.get('Subject', ''),
+                'Message': message['Message'],
+                'Timestamp': message['Timestamp'],
+                'SignatureVersion': '1',
+                'Signature': 'demo-signature',  # In real SNS, this would be signed
+                'MessageAttributes': message.get('MessageAttributes', {})
+            }
+            
+            try:
+                response = requests.post(
+                    endpoint,
+                    json=payload,
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10
+                )
+                response.raise_for_status()
+                logger.debug(f"Delivered message {message['MessageId']} to {endpoint}")
+                
+            except requests.RequestException as e:
+                logger.warning(f"HTTP delivery failed to {endpoint}: {e}")
+                raise
+        
+        def _deliver_https(self, subscription, message):
+            """Deliver message via HTTPS POST"""
+            # Same as HTTP but with SSL verification
+            self._deliver_http(subscription, message)
+        
+        def _deliver_webhook(self, subscription, message):
+            """Deliver message via webhook"""
+            self._deliver_http(subscription, message)
+        
+        def get_topic_stats(self):
+            """Get statistics for all topics"""
+            with self.lock:
+                return {
+                    topic_arn: {
+                        'name': config['name'],
+                        'messages': config['message_count'],
+                        'subscriptions': config['subscription_count'],
+                        'created': config['created_at']
+                    }
+                    for topic_arn, config in self.topics.items()
+                }
+        
+        def list_topics(self):
+            """List all topics"""
+            with self.lock:
+                return list(self.topics.keys())
+        
+        def list_subscriptions(self, topic_arn=None):
+            """List subscriptions for topic or all"""
+            with self.lock:
+                if topic_arn:
+                    return self.subscriptions.get(topic_arn, [])
+                else:
+                    all_subs = []
+                    for subs in self.subscriptions.values():
+                        all_subs.extend(subs)
+                    return all_subs
+    
+    
+    # Global topic manager
+    topic_manager = TopicManager()
+    
+    
+    @app.route('/health')
+    def health():
+        """Health check endpoint"""
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'topics': len(topic_manager.topics),
+            'total_subscriptions': sum(len(subs) for subs in topic_manager.subscriptions.values())
+        })
+    
+    
+    @app.route('/stats')
+    def stats():
+        """Statistics endpoint"""
+        return jsonify(topic_manager.get_topic_stats())
+    
+    
+    @app.route('/topics', methods=['GET'])
+    def list_topics():
+        """List all topics"""
+        topics = topic_manager.list_topics()
+        return jsonify({
+            'topics': topics,
+            'count': len(topics)
+        })
+    
+    
+    @app.route('/topics', methods=['POST'])
+    def create_topic():
+        """Create a new topic"""
+        data = request.get_json()
+        
+        if not data or 'name' not in data:
+            return jsonify({'error': 'Topic name required'}), 400
+        
+        topic_arn = topic_manager.create_topic(data['name'], data.get('config', {}))
+        
+        return jsonify({
+            'topic_arn': topic_arn,
+            'message': f'Topic {data["name"]} created'
+        })
+    
+    
+    @app.route('/subscribe', methods=['POST'])
+    def subscribe():
+        """Subscribe to a topic"""
+        data = request.get_json()
+        
+        required_fields = ['topic_arn', 'protocol', 'endpoint']
+        if not all(field in data for field in required_fields):
+            return jsonify({'error': f'Required fields: {required_fields}'}), 400
+        
+        subscription_arn = topic_manager.subscribe(
+            data['topic_arn'],
+            data['protocol'], 
+            data['endpoint'],
+            data.get('attributes', {})
+        )
+        
+        return jsonify({
+            'subscription_arn': subscription_arn,
+            'message': 'Subscription created'
+        })
+    
+    
+    @app.route('/publish', methods=['POST'])
+    def publish():
+        """Publish message to topic"""
+        data = request.get_json()
+        
+        if not data or 'topic_arn' not in data or 'message' not in data:
+            return jsonify({'error': 'topic_arn and message required'}), 400
+        
+        message_id = topic_manager.publish(
+            data['topic_arn'],
+            data['message'],
+            data.get('attributes', {})
+        )
+        
+        return jsonify({
+            'message_id': message_id,
+            'message': 'Message published'
+        })
+    
+    
+    @app.route('/subscriptions')
+    def list_subscriptions():
+        """List all subscriptions"""
+        topic_arn = request.args.get('topic_arn')
+        subscriptions = topic_manager.list_subscriptions(topic_arn)
+        
+        return jsonify({
+            'subscriptions': subscriptions,
+            'count': len(subscriptions)
+        })
+    
+    
+    @app.route('/demo/structured-publish', methods=['POST'])
+    def demo_structured_publish():
+        """Demo endpoint for publishing structured K8sGPT analysis"""
+        data = request.get_json()
+        
+        if not data or 'analysis_id' not in data or 'structured_data' not in data:
+            return jsonify({'error': 'analysis_id and structured_data required'}), 400
+        
+        analysis_id = data['analysis_id']
+        structured_data = data['structured_data']
+        
+        published_messages = {}
+        
+        # Publish each component to its respective topic
+        for component, content in structured_data.items():
+            topic_name = f'k8sgpt.analysis.{component}'
+            topic_arn = f'arn:k8sgpt:sns:demo:k8sgpt:{topic_name}'
+            
+            # Create message payload
+            message_payload = {
+                'analysis_id': analysis_id,
+                'component': component,
+                'content': content,
+                'content_type': 'text/markdown',
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Publish to topic
+            message_id = topic_manager.publish(
+                topic_arn,
+                json.dumps(message_payload),
+                {
+                    'Subject': f'K8sGPT Analysis - {component.title()}',
+                    'AnalysisId': analysis_id,
+                    'Component': component
+                }
+            )
+            
+            published_messages[component] = message_id
+            
+            # Write to file system for persistence
+            os.makedirs('/data/published', exist_ok=True)
+            with open(f'/data/published/{analysis_id}_{component}_published.json', 'w') as f:
+                json.dump({
+                    'message_id': message_id,
+                    'topic_arn': topic_arn,
+                    'payload': message_payload,
+                    'published_at': datetime.now().isoformat()
+                }, f, indent=2)
+        
+        return jsonify({
+            'analysis_id': analysis_id,
+            'published_messages': published_messages,
+            'topics_published': len(published_messages)
+        })
+    
+    
+    if __name__ == '__main__':
+        logger.info("Starting K8sGPT Publisher Service")
+        logger.info("Endpoints available:")
+        logger.info("  GET  /health - Health check")
+        logger.info("  GET  /stats - Statistics")  
+        logger.info("  GET  /topics - List topics")
+        logger.info("  POST /topics - Create topic")
+        logger.info("  POST /subscribe - Subscribe to topic")
+        logger.info("  POST /publish - Publish message")
+        logger.info("  GET  /subscriptions - List subscriptions")
+        logger.info("  POST /demo/structured-publish - Demo structured publishing")
+        
+        app.run(host='0.0.0.0', port=8081, debug=False)
+
+---
+# Example Subscriber Application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8sgpt-subscriber-example
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-subscriber
+    component: demo-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8sgpt-subscriber
+  template:
+    metadata:
+      labels:
+        app: k8sgpt-subscriber
+        component: demo-app
+    spec:
+      containers:
+      - name: subscriber
+        image: python:3.9-slim
+        ports:
+        - containerPort: 8082
+        env:
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: PUBLISHER_URL
+          value: "http://k8sgpt-publisher-service:8081"
+        volumeMounts:
+        - name: subscriber-script
+          mountPath: /app
+        - name: received-data
+          mountPath: /data/received
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install flask requests &&
+          cd /app &&
+          python3 subscriber_app.py
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "25m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: received-data
+        emptyDir: {}
+      - name: subscriber-script
+        configMap:
+          name: subscriber-app-script
+          defaultMode: 0755
+
+---
+# Service for Subscriber
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8sgpt-subscriber-service
+  namespace: k8sgpt-demo
+  labels:
+    app: k8sgpt-subscriber
+spec:
+  selector:
+    app: k8sgpt-subscriber
+  ports:
+  - port: 8082
+    targetPort: 8082
+    name: http
+  type: ClusterIP
+
+---
+# ConfigMap with the Subscriber Application script
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: subscriber-app-script
+  namespace: k8sgpt-demo
+data:
+  subscriber_app.py: |
+    #!/usr/bin/env python3
+    """
+    Example Subscriber Application
+    
+    Demonstrates how applications can subscribe to structured K8sGPT analysis data.
+    Shows processing of symptom, explanation, diagnosis, remediation, and recommendation data.
+    """
+    
+    import json
+    import logging
+    import os
+    import time
+    import requests
+    from datetime import datetime
+    from threading import Thread
+    from collections import defaultdict
+    
+    from flask import Flask, request, jsonify
+    
+    logging.basicConfig(
+        level=os.getenv('LOG_LEVEL', 'INFO'),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    app = Flask(__name__)
+    
+    
+    class K8sGPTSubscriber:
+        """Example subscriber that processes structured K8sGPT analysis"""
+        
+        def __init__(self, publisher_url):
+            self.publisher_url = publisher_url
+            self.received_messages = defaultdict(list)
+            self.analysis_cache = {}  # analysis_id -> components
+            self.subscriptions = []
+            
+            # Initialize subscriptions
+            self._setup_subscriptions()
+        
+        def _setup_subscriptions(self):
+            """Subscribe to all K8sGPT analysis topics"""
+            topics = [
+                'k8sgpt.analysis.symptom',
+                'k8sgpt.analysis.explanation',
+                'k8sgpt.analysis.diagnosis', 
+                'k8sgpt.analysis.remediation',
+                'k8sgpt.analysis.recommendation'
+            ]
+            
+            for topic in topics:
+                self._subscribe_to_topic(topic)
+        
+        def _subscribe_to_topic(self, topic_name):
+            """Subscribe to a specific topic"""
+            try:
+                topic_arn = f'arn:k8sgpt:sns:demo:k8sgpt:{topic_name}'
+                endpoint = f'http://k8sgpt-subscriber-service:8082/receive/{topic_name.split(".")[-1]}'
+                
+                response = requests.post(f'{self.publisher_url}/subscribe', json={
+                    'topic_arn': topic_arn,
+                    'protocol': 'http',
+                    'endpoint': endpoint,
+                    'attributes': {
+                        'subscriber': 'k8sgpt-demo-app',
+                        'topic': topic_name
+                    }
+                }, timeout=10)
+                
+                if response.status_code == 200:
+                    subscription_data = response.json()
+                    self.subscriptions.append(subscription_data['subscription_arn'])
+                    logger.info(f"Subscribed to {topic_name}")
+                else:
+                    logger.error(f"Failed to subscribe to {topic_name}: {response.text}")
+                    
+            except Exception as e:
+                logger.error(f"Subscription error for {topic_name}: {e}")
+        
+        def process_message(self, component, message_data):
+            """Process received message from SNS topic"""
+            try:
+                # Parse SNS message format
+                message_content = json.loads(message_data.get('Message', '{}'))
+                
+                analysis_id = message_content.get('analysis_id')
+                component_content = message_content.get('content', '')
+                timestamp = message_content.get('timestamp')
+                
+                if not analysis_id:
+                    logger.warning(f"Received {component} message without analysis_id")
+                    return
+                
+                logger.info(f"Processing {component} for analysis {analysis_id}")
+                
+                # Store message
+                self.received_messages[component].append(message_data)
+                
+                # Add to analysis cache
+                if analysis_id not in self.analysis_cache:
+                    self.analysis_cache[analysis_id] = {}
+                
+                self.analysis_cache[analysis_id][component] = {
+                    'content': component_content,
+                    'timestamp': timestamp,
+                    'received_at': datetime.now().isoformat()
+                }
+                
+                # Process based on component type
+                if component == 'symptom':
+                    self._process_symptom(analysis_id, component_content)
+                elif component == 'explanation':
+                    self._process_explanation(analysis_id, component_content)
+                elif component == 'diagnosis':
+                    self._process_diagnosis(analysis_id, component_content)
+                elif component == 'remediation':
+                    self._process_remediation(analysis_id, component_content)
+                elif component == 'recommendation':
+                    self._process_recommendation(analysis_id, component_content)
+                
+                # Check if complete analysis received
+                self._check_complete_analysis(analysis_id)
+                
+                # Save to file
+                self._save_component(analysis_id, component, component_content)
+                
+            except Exception as e:
+                logger.error(f"Error processing {component} message: {e}")
+        
+        def _process_symptom(self, analysis_id, content):
+            """Process symptom information"""
+            logger.info(f"🚨 SYMPTOM detected for {analysis_id}")
+            # Here you could trigger alerts, notifications, etc.
+            
+        def _process_explanation(self, analysis_id, content):
+            """Process explanation information"""  
+            logger.info(f"📖 EXPLANATION received for {analysis_id}")
+            # Here you could update dashboards, documentation, etc.
+            
+        def _process_diagnosis(self, analysis_id, content):
+            """Process diagnosis information"""
+            logger.info(f"🔍 DIAGNOSIS completed for {analysis_id}")
+            # Here you could trigger automated investigations
+            
+        def _process_remediation(self, analysis_id, content):
+            """Process remediation information"""
+            logger.info(f"🔧 REMEDIATION steps for {analysis_id}")
+            # Here you could trigger automated fixes, create tickets, etc.
+            
+        def _process_recommendation(self, analysis_id, content):
+            """Process recommendation information"""
+            logger.info(f"💡 RECOMMENDATIONS for {analysis_id}")
+            # Here you could update best practices, create improvement tasks, etc.
+        
+        def _check_complete_analysis(self, analysis_id):
+            """Check if complete analysis has been received"""
+            required_components = {'symptom', 'explanation', 'diagnosis', 'remediation', 'recommendation'}
+            received_components = set(self.analysis_cache.get(analysis_id, {}).keys())
+            
+            if required_components.issubset(received_components):
+                logger.info(f"✅ COMPLETE ANALYSIS received for {analysis_id}")
+                self._process_complete_analysis(analysis_id)
+        
+        def _process_complete_analysis(self, analysis_id):
+            """Process complete analysis when all components received"""
+            analysis = self.analysis_cache[analysis_id]
+            
+            # Generate summary report
+            summary = {
+                'analysis_id': analysis_id,
+                'completed_at': datetime.now().isoformat(),
+                'components': list(analysis.keys()),
+                'summary': self._generate_summary(analysis)
+            }
+            
+            # Save complete analysis
+            os.makedirs('/data/received', exist_ok=True)
+            with open(f'/data/received/{analysis_id}_complete.json', 'w') as f:
+                json.dump(summary, f, indent=2)
+            
+            logger.info(f"Complete analysis saved for {analysis_id}")
+        
+        def _generate_summary(self, analysis):
+            """Generate analysis summary"""
+            return {
+                'has_symptom': 'symptom' in analysis,
+                'has_explanation': 'explanation' in analysis,
+                'has_diagnosis': 'diagnosis' in analysis,
+                'has_remediation': 'remediation' in analysis,  
+                'has_recommendation': 'recommendation' in analysis,
+                'component_count': len(analysis)
+            }
+        
+        def _save_component(self, analysis_id, component, content):
+            """Save component to file"""
+            try:
+                os.makedirs('/data/received', exist_ok=True)
+                filename = f'/data/received/{analysis_id}_{component}.md'
+                
+                with open(filename, 'w') as f:
+                    f.write(f"# {component.title()} - Analysis {analysis_id}\n\n")
+                    f.write(f"Received at: {datetime.now().isoformat()}\n\n")
+                    f.write(content)
+                
+                logger.debug(f"Saved {component} to {filename}")
+                
+            except Exception as e:
+                logger.error(f"Failed to save {component}: {e}")
+        
+        def get_stats(self):
+            """Get subscriber statistics"""
+            return {
+                'subscriptions': len(self.subscriptions),
+                'analyses_cached': len(self.analysis_cache),
+                'messages_received': {
+                    component: len(messages) 
+                    for component, messages in self.received_messages.items()
+                },
+                'complete_analyses': sum(
+                    1 for analysis in self.analysis_cache.values()
+                    if len(analysis) >= 5  # All components
+                )
+            }
+    
+    
+    # Global subscriber
+    publisher_url = os.getenv('PUBLISHER_URL', 'http://k8sgpt-publisher-service:8081')
+    subscriber = K8sGPTSubscriber(publisher_url)
+    
+    
+    @app.route('/health')
+    def health():
+        """Health check endpoint"""
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'subscriptions': len(subscriber.subscriptions)
+        })
+    
+    
+    @app.route('/stats')
+    def stats():
+        """Statistics endpoint"""
+        return jsonify(subscriber.get_stats())
+    
+    
+    @app.route('/receive/<component>', methods=['POST'])
+    def receive_message(component):
+        """Receive SNS message for specific component"""
+        try:
+            message_data = request.get_json()
+            
+            if not message_data:
+                return jsonify({'error': 'No message data'}), 400
+            
+            # Process the message
+            subscriber.process_message(component, message_data)
+            
+            return jsonify({
+                'status': 'received',
+                'component': component,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+        except Exception as e:
+            logger.error(f"Error receiving {component} message: {e}")
+            return jsonify({'error': str(e)}), 500
+    
+    
+    @app.route('/analyses')
+    def list_analyses():
+        """List received analyses"""
+        return jsonify({
+            'analyses': list(subscriber.analysis_cache.keys()),
+            'count': len(subscriber.analysis_cache)
+        })
+    
+    
+    @app.route('/analyses/<analysis_id>')
+    def get_analysis(analysis_id):
+        """Get specific analysis"""
+        if analysis_id not in subscriber.analysis_cache:
+            return jsonify({'error': 'Analysis not found'}), 404
+        
+        return jsonify({
+            'analysis_id': analysis_id,
+            'components': subscriber.analysis_cache[analysis_id]
+        })
+    
+    
+    def setup_subscriptions():
+        """Setup subscriptions on startup"""
+        # Wait for publisher to be ready
+        max_retries = 30
+        for i in range(max_retries):
+            try:
+                response = requests.get(f'{publisher_url}/health', timeout=5)
+                if response.status_code == 200:
+                    logger.info("Publisher is ready, setting up subscriptions")
+                    break
+            except Exception as e:
+                logger.info(f"Waiting for publisher... ({i+1}/{max_retries})")
+                time.sleep(5)
+        else:
+            logger.error("Publisher not ready after waiting")
+            return
+        
+        # Subscriptions are set up in __init__
+        logger.info("Subscription setup complete")
+    
+    
+    if __name__ == '__main__':
+        logger.info("Starting K8sGPT Subscriber Example")
+        logger.info("Endpoints available:")
+        logger.info("  GET  /health - Health check")
+        logger.info("  GET  /stats - Statistics")
+        logger.info("  POST /receive/<component> - Receive SNS messages")
+        logger.info("  GET  /analyses - List analyses")
+        logger.info("  GET  /analyses/<id> - Get specific analysis")
+        
+        # Setup subscriptions in background
+        Thread(target=setup_subscriptions, daemon=True).start()
+        
+        app.run(host='0.0.0.0', port=8082, debug=False)
